@@ -1,75 +1,869 @@
+%%writefile atm.cpp
 
-import java.util.Scanner;
-class ATM{
-    float Balance = 10000;
-    int Pin = 1234;
-    public void Checkpin(){
-System.out.println("Enter PIN:");
-Scanner sc = new Scanner(System.in);
-int enteredpin = sc.nextInt();
-if(enteredpin==Pin){
-    menu();
-}
-else{
-    System.out.println("Enter a valid PIN!!");
-}
+#include <iostream>
+#include <queue>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <iomanip>
+#include <random>
+#include <ctime>
 
-    }
-    public void menu(){
-    System.err.println("To Check Account Balance; Enter 1");
-    System.err.println("For Withdrawl; Enter 2");
-    System.err.println("For Deposit; Enter 3");
-    System.err.println("To Exit; Enter 4");
-    Scanner sc = new Scanner(System.in);
-    int opt = sc.nextInt();
-    if(opt==1){
-        checkbalance();
-    }
-    else if(opt==2){
-        withdrawmoney();
-    }
-    else if(opt==3){
-        depositmoney();
-    }
-    else if(opt==4){
-        return;
-    }
-    else{
-        System.out.println("Enter a valid choice:");
+using namespace std;
+
+enum class TransactionType {
+    WITHDRAW,
+    DEPOSIT,
+    BALANCE
+};
+
+struct Cell {
+    int cellId;
+    int transactionId;
+    int accountId;
+
+    TransactionType type;
+
+    double amount;
+
+    int source;
+    int destination;
+
+    bool processed;
+    bool successful;
+
+    string response;
+};
+
+
+class Account {
+private:
+    int accountId;
+    string accountHolder;
+    double balance;
+
+public:
+
+    Account() {
+        accountId = 0;
+        accountHolder = "";
+        balance = 0;
     }
 
+    Account(int id, string name, double initialBalance) {
+        accountId = id;
+        accountHolder = name;
+        balance = initialBalance;
     }
-    public void checkbalance(){
-        System.out.println("Balance:" + Balance);
-        menu();
+
+    int getAccountId() const {
+        return accountId;
     }
-    public void withdrawmoney(){
-        System.out.println("Enter amount to be withrawn:");
-        Scanner sc = new Scanner(System.in);
-        float amount = sc.nextFloat();
-        if(amount>Balance) {
-            System.out.println("Insufficient Balance");
+
+    string getAccountHolder() const {
+        return accountHolder;
+    }
+
+    double getBalance() const {
+        return balance;
+    }
+
+    bool withdraw(double amount) {
+
+        if (amount <= 0) {
+            return false;
         }
-        else{
-            Balance = Balance - amount;
-            System.out.println("Money Withdrawl Successful!!");
+
+        if (amount > balance) {
+            return false;
         }
-        menu();
+
+        balance -= amount;
+
+        return true;
     }
-    public void depositmoney(){
-        System.out.println("Enter amount:");
-        Scanner sc = new Scanner(System.in);
-        float amount = sc.nextFloat();
-        Balance = Balance + amount;
-        System.out.println("Money Deposition Successful!!");
+
+    bool deposit(double amount) {
+
+        if (amount <= 0) {
+            return false;
+        }
+
+        balance += amount;
+
+        return true;
     }
-}
+};
 
 
-public class ATMMachine {
-    public static void main(String[] args) {
-        ATM obj = new ATM();
-        obj.Checkpin(); 
+
+struct TransactionLog {
+    int transactionId;
+    int accountId;
+    TransactionType type;
+
+    double amount;
+
+    bool successful;
+
+    string response;
+};
+
+
+class CellSwitch {
+
+public:
+
+    string routeCell(const Cell& cell) {
+
+        if (cell.destination == 1) {
+            return "BANKING_PROCESSOR";
+        }
+
+        if (cell.destination == 2) {
+            return "AUDIT_SERVICE";
+        }
+
+        return "UNKNOWN_DESTINATION";
     }
+};
+
+
+class TransactionProcessor {
+
+public:
+
+    string processCell(
+        Cell& cell,
+        unordered_map<int, Account>& accounts
+    ) {
+
+        
+
+        if (accounts.find(cell.accountId) == accounts.end()) {
+
+            cell.processed = true;
+            cell.successful = false;
+
+            return "Account not found";
+        }
+
+        Account& account = accounts[cell.accountId];
+
+
+        
+
+        if (cell.type == TransactionType::WITHDRAW) {
+
+            if (cell.amount <= 0) {
+
+                cell.processed = true;
+                cell.successful = false;
+
+                return "Invalid withdrawal amount";
+            }
+
+            if (account.withdraw(cell.amount)) {
+
+                cell.processed = true;
+                cell.successful = true;
+
+                return "Withdrawal successful";
+            }
+
+            cell.processed = true;
+            cell.successful = false;
+
+            return "Insufficient balance";
+        }
+
+
+        if (cell.type == TransactionType::DEPOSIT) {
+
+            if (cell.amount <= 0) {
+
+                cell.processed = true;
+                cell.successful = false;
+
+                return "Invalid deposit amount";
+            }
+
+            if (account.deposit(cell.amount)) {
+
+                cell.processed = true;
+                cell.successful = true;
+
+                return "Deposit successful";
+            }
+
+            cell.processed = true;
+            cell.successful = false;
+
+            return "Deposit failed";
+        }
+
+
+        if (cell.type == TransactionType::BALANCE) {
+
+            cell.processed = true;
+            cell.successful = true;
+
+            return "Current balance: Rs. " +
+                   to_string(account.getBalance());
+        }
+
+
+        cell.processed = true;
+        cell.successful = false;
+
+        return "Unknown transaction type";
+    }
+};
+
+
+class ATMSystem {
+
+private:
+
+
+    unordered_map<int, Account> accounts;
+
+   
+    queue<Cell> transactionQueue;
+
+
+    vector<TransactionLog> transactionHistory;
+
+
+    CellSwitch cellSwitch;
+
+    TransactionProcessor processor;
+
     
+    int nextCellId;
+    int nextTransactionId;
+
+    int successfulTransactions;
+    int failedTransactions;
+
+
+public:
+
+    ATMSystem() {
+
+        nextCellId = 1;
+        nextTransactionId = 1001;
+
+        successfulTransactions = 0;
+        failedTransactions = 0;
+    }
+
+
+
+    void addAccount(
+        int accountId,
+        string name,
+        double initialBalance
+    ) {
+
+        accounts.emplace(
+            accountId,
+            Account(
+                accountId,
+                name,
+                initialBalance
+            )
+        );
+    }
+
+
+    bool accountExists(int accountId) {
+
+        return accounts.find(accountId)
+               != accounts.end();
+    }
+
+
+    void showAccount(int accountId) {
+
+        if (!accountExists(accountId)) {
+
+            cout << "Account not found.\n";
+
+            return;
+        }
+
+        Account& account = accounts[accountId];
+
+        cout << "\n-----------------------------\n";
+        cout << "Account ID      : "
+             << account.getAccountId() << "\n";
+
+        cout << "Account Holder  : "
+             << account.getAccountHolder() << "\n";
+
+        cout << fixed << setprecision(2);
+
+        cout << "Balance         : Rs. "
+             << account.getBalance() << "\n";
+
+        cout << "-----------------------------\n";
+    }
+
+
+   
+
+    void establishConnection(int accountId) {
+
+        cout << "\n[CONNECTION] ";
+        cout << "Connection established for Account "
+             << accountId << "\n";
+    }
+
+
+    void terminateConnection(int accountId) {
+
+        cout << "[CONNECTION] ";
+        cout << "Connection terminated for Account "
+             << accountId << "\n";
+    }
+
+
+
+    Cell createCell(
+        int accountId,
+        TransactionType type,
+        double amount
+    ) {
+
+        Cell cell;
+
+        cell.cellId = nextCellId++;
+
+        cell.transactionId =
+            nextTransactionId++;
+
+        cell.accountId = accountId;
+
+        cell.type = type;
+
+        cell.amount = amount;
+
+   
+        cell.source = 0;
+
+        cell.destination = 1;
+
+        cell.processed = false;
+
+        cell.successful = false;
+
+        cell.response = "";
+
+        return cell;
+    }
+
+
+
+    void enqueueTransaction(Cell cell) {
+
+        transactionQueue.push(cell);
+    }
+
+
+    
+
+    void processNextCell() {
+
+        if (transactionQueue.empty()) {
+
+            cout << "No transactions in queue.\n";
+
+            return;
+        }
+
+  
+        Cell cell = transactionQueue.front();
+
+
+        transactionQueue.pop();
+
+
+        cout << "\n========================================\n";
+
+        cout << "Processing Cell\n";
+
+        cout << "Cell ID        : "
+             << cell.cellId << "\n";
+
+        cout << "Transaction ID : "
+             << cell.transactionId << "\n";
+
+        cout << "Account ID     : "
+             << cell.accountId << "\n";
+
+
+     
+
+        establishConnection(cell.accountId);
+
+
+      
+
+        string destination =
+            cellSwitch.routeCell(cell);
+
+        cout << "[SWITCH] Cell "
+             << cell.cellId
+             << " routed to "
+             << destination << "\n";
+
+
+
+        cell.response =
+            processor.processCell(
+                cell,
+                accounts
+            );
+
+
+
+        if (cell.successful) {
+
+            successfulTransactions++;
+
+        } else {
+
+            failedTransactions++;
+        }
+
+
+    
+
+        TransactionLog log;
+
+        log.transactionId =
+            cell.transactionId;
+
+        log.accountId =
+            cell.accountId;
+
+        log.type =
+            cell.type;
+
+        log.amount =
+            cell.amount;
+
+        log.successful =
+            cell.successful;
+
+        log.response =
+            cell.response;
+
+        transactionHistory.push_back(log);
+
+
+     
+
+        cout << "[PROCESSOR] "
+             << cell.response
+             << "\n";
+
+
+      
+
+        terminateConnection(cell.accountId);
+
+        cout << "========================================\n";
+    }
+
+
+    
+
+    void processAllTransactions() {
+
+        while (!transactionQueue.empty()) {
+
+            processNextCell();
+        }
+    }
+
+
+  
+
+    void withdraw(
+        int accountId,
+        double amount
+    ) {
+
+        if (!accountExists(accountId)) {
+
+            cout << "Account not found.\n";
+
+            return;
+        }
+
+        Cell cell =
+            createCell(
+                accountId,
+                TransactionType::WITHDRAW,
+                amount
+            );
+
+        enqueueTransaction(cell);
+
+        cout << "\nWithdrawal transaction added to queue.\n";
+
+        processNextCell();
+    }
+
+
+    void deposit(
+        int accountId,
+        double amount
+    ) {
+
+        if (!accountExists(accountId)) {
+
+            cout << "Account not found.\n";
+
+            return;
+        }
+
+        Cell cell =
+            createCell(
+                accountId,
+                TransactionType::DEPOSIT,
+                amount
+            );
+
+        enqueueTransaction(cell);
+
+        cout << "\nDeposit transaction added to queue.\n";
+
+        processNextCell();
+    }
+
+
+    void balanceInquiry(
+        int accountId
+    ) {
+
+        if (!accountExists(accountId)) {
+
+            cout << "Account not found.\n";
+
+            return;
+        }
+
+        Cell cell =
+            createCell(
+                accountId,
+                TransactionType::BALANCE,
+                0
+            );
+
+        enqueueTransaction(cell);
+
+        cout << "\nBalance inquiry added to queue.\n";
+
+        processNextCell();
+    }
+
+
+
+    void simulateTransactions(int numberOfTransactions) {
+
+        cout << "\n";
+        cout << "========================================\n";
+        cout << "STARTING TRANSACTION SIMULATION\n";
+        cout << "Transactions: "
+             << numberOfTransactions << "\n";
+        cout << "========================================\n";
+
+
+     
+        random_device rd;
+
+        mt19937 generator(rd());
+
+
+     
+
+        uniform_int_distribution<int>
+            typeDistribution(0, 2);
+
+
+    
+
+        uniform_int_distribution<int>
+            amountDistribution(100, 5000);
+
+
+        
+
+        int accountId = 1001;
+
+
+        for (int i = 0;
+             i < numberOfTransactions;
+             i++) {
+
+
+            int randomType =
+                typeDistribution(generator);
+
+
+            TransactionType type;
+
+
+            if (randomType == 0) {
+
+                type = TransactionType::WITHDRAW;
+
+            }
+            else if (randomType == 1) {
+
+                type = TransactionType::DEPOSIT;
+
+            }
+            else {
+
+                type = TransactionType::BALANCE;
+            }
+
+
+            double amount = 0;
+
+
+            if (type != TransactionType::BALANCE) {
+
+                amount =
+                    amountDistribution(generator);
+            }
+
+
+            Cell cell =
+                createCell(
+                    accountId,
+                    type,
+                    amount
+                );
+
+
+            enqueueTransaction(cell);
+        }
+
+
+
+        processAllTransactions();
+
+
+        cout << "\n";
+        cout << "========================================\n";
+        cout << "SIMULATION COMPLETE\n";
+        cout << "========================================\n";
+    }
+
+
+
+    void showStatistics() {
+
+        cout << "\n";
+        cout << "========================================\n";
+        cout << "TRANSACTION STATISTICS\n";
+        cout << "========================================\n";
+
+        cout << "Total Transactions : "
+             << transactionHistory.size()
+             << "\n";
+
+        cout << "Successful         : "
+             << successfulTransactions
+             << "\n";
+
+        cout << "Failed             : "
+             << failedTransactions
+             << "\n";
+
+
+        if (!transactionHistory.empty()) {
+
+            double successRate =
+                (successfulTransactions * 100.0)
+                / transactionHistory.size();
+
+            cout << fixed
+                 << setprecision(2);
+
+            cout << "Success Rate       : "
+                 << successRate
+                 << "%\n";
+        }
+
+        cout << "========================================\n";
+    }
+
+
+
+    void showTransactionHistory() {
+
+        cout << "\n";
+        cout << "========================================\n";
+        cout << "TRANSACTION HISTORY\n";
+        cout << "========================================\n";
+
+
+        for (const auto& log :
+             transactionHistory) {
+
+
+            cout << "\nTransaction ID : "
+                 << log.transactionId;
+
+            cout << "\nAccount ID     : "
+                 << log.accountId;
+
+
+            cout << "\nType           : ";
+
+
+            if (log.type ==
+                TransactionType::WITHDRAW) {
+
+                cout << "WITHDRAW";
+            }
+
+            else if (
+                log.type ==
+                TransactionType::DEPOSIT) {
+
+                cout << "DEPOSIT";
+            }
+
+            else {
+
+                cout << "BALANCE";
+            }
+
+
+            cout << "\nAmount         : Rs. "
+                 << fixed
+                 << setprecision(2)
+                 << log.amount;
+
+
+            cout << "\nStatus         : ";
+
+
+            if (log.successful) {
+
+                cout << "SUCCESS";
+
+            } else {
+
+                cout << "FAILED";
+            }
+
+
+            cout << "\nResponse       : "
+                 << log.response;
+
+            cout << "\n-----------------------------";
+        }
+
+        cout << "\n";
+    }
+};
+
+
+
+
+int main() {
+
+    ATMSystem atm;
+
+
+
+
+    atm.addAccount(
+        1001,
+        "John Doe",
+        50000
+    );
+
+
+    atm.addAccount(
+        1002,
+        "Alice",
+        25000
+    );
+
+
+    cout << "========================================\n";
+    cout << "      ATM BANKING SIMULATION\n";
+    cout << "========================================\n";
+
+
+   
+
+    atm.showAccount(1001);
+
+
+  
+
+    cout << "\n\n--- MANUAL TRANSACTIONS ---\n";
+
+
+
+    atm.withdraw(
+        1001,
+        5000
+    );
+
+
+
+
+    atm.deposit(
+        1001,
+        10000
+    );
+
+
+
+
+    atm.balanceInquiry(
+        1001
+    );
+
+
+
+    atm.withdraw(
+        1001,
+        100000
+    );
+
+
+
+    cout << "\n\n--- UPDATED ACCOUNT ---\n";
+
+    atm.showAccount(1001);
+
+
+
+    atm.simulateTransactions(100);
+
+
+    
+
+    atm.showStatistics();
+
+
+
+    cout << "\n\n--- FINAL ACCOUNT STATUS ---\n";
+
+    atm.showAccount(1001);
+
+
+    return 0;
 }
