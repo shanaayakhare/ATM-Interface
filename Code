@@ -1,867 +1,447 @@
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
-#include <queue>
-#include <unordered_map>
-#include <vector>
-#include <string>
-#include <iomanip>
+#include <map>
+#include <memory>
+#include <optional>
 #include <random>
-#include <ctime>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <vector>
 
-using namespace std;
+using Bytes = std::vector<uint8_t>;
 
-enum class TransactionType {
-    WITHDRAW,
-    DEPOSIT,
-    BALANCE
-};
+// ----------------------------------------------------------------- constants
+constexpr int    CELL_SIZE = 53, HEADER_SIZE = 5, PAYLOAD_SIZE = 48;
+constexpr double CELL_TIME_US    = CELL_SIZE * 8 / 155.52;  // ~2.73 us @ OC-3
+constexpr double SWITCH_DELAY_US = 5.0;    // per-switch fabric delay
+constexpr double CALL_PROC_US    = 100.0;  // per-switch signaling time
+constexpr double BANK_PROC_US    = 20.0;   // bank host processing
+constexpr int    FIRST_VCI       = 32;     // VCIs 0-31 reserved
 
+static bool TRACE = false;
+#define TRACEF(...) do { if (TRACE) { std::printf("      "); std::printf(__VA_ARGS__); std::printf("\n"); } } while (0)
+
+// -------------------------------------------------------------------- CRCs
+// ATM HEC: CRC-8 (x^8+x^2+x+1) over first 4 header bytes, XOR 0x55
+static uint8_t crc8(const uint8_t* d, size_t n) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= d[i];
+        for (int b = 0; b < 8; ++b)
+            crc = (crc & 0x80) ? uint8_t((crc << 1) ^ 0x07) : uint8_t(crc << 1);
+    }
+    return crc ^ 0x55;
+}
+
+// Standard CRC-32 (IEEE 802.3), as used by the AAL5 trailer
+static uint32_t crc32(const uint8_t* d, size_t n) {
+    static uint32_t table[256];
+    static bool init = false;
+    if (!init) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+        init = true;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+// -------------------------------------------------------------------- cells
 struct Cell {
-    int cellId;
-    int transactionId;
-    int accountId;
+    int vpi = 0, vci = 0, pt = 0;          // pt bit0 = AAL5 end-of-frame
+    std::array<uint8_t, PAYLOAD_SIZE> payload{};
+    double t = 0.0;                        // accumulated virtual time (us)
 
-    TransactionType type;
+    std::array<uint8_t, CELL_SIZE> toBytes() const {
+        std::array<uint8_t, CELL_SIZE> raw{};
+        uint32_t word = (uint32_t(vpi) << 20) | (uint32_t(vci) << 4) | (uint32_t(pt) << 1);
+        for (int i = 0; i < 4; ++i) raw[i] = uint8_t(word >> (24 - 8 * i));
+        raw[4] = crc8(raw.data(), 4);
+        for (int i = 0; i < PAYLOAD_SIZE; ++i) raw[HEADER_SIZE + i] = payload[i];
+        return raw;
+    }
 
-    double amount;
-
-    int source;
-    int destination;
-
-    bool processed;
-    bool successful;
-
-    string response;
+    static std::optional<Cell> fromBytes(const std::array<uint8_t, CELL_SIZE>& raw, double t) {
+        if (crc8(raw.data(), 4) != raw[4]) return std::nullopt;   // HEC error
+        uint32_t word = 0;
+        for (int i = 0; i < 4; ++i) word = (word << 8) | raw[i];
+        Cell c;
+        c.vpi = (word >> 20) & 0xFF;
+        c.vci = (word >> 4) & 0xFFFF;
+        c.pt  = (word >> 1) & 0x7;
+        for (int i = 0; i < PAYLOAD_SIZE; ++i) c.payload[i] = raw[HEADER_SIZE + i];
+        c.t = t;
+        return c;
+    }
 };
 
+// AAL5-like segmentation: pad, trailer (UU, CPI, length, CRC-32), 48-byte cells
+static std::vector<Cell> segment(const std::string& data, int vpi, int vci) {
+    Bytes body(data.begin(), data.end());
+    size_t pad = (PAYLOAD_SIZE - (data.size() + 8) % PAYLOAD_SIZE) % PAYLOAD_SIZE;
+    body.insert(body.end(), pad, 0);
+    body.push_back(0);                                   // UU
+    body.push_back(0);                                   // CPI
+    body.push_back(uint8_t(data.size() >> 8));
+    body.push_back(uint8_t(data.size() & 0xFF));
+    uint32_t crc = crc32(body.data(), body.size());
+    for (int i = 3; i >= 0; --i) body.push_back(uint8_t(crc >> (8 * i)));
 
-class Account {
-private:
-    int accountId;
-    string accountHolder;
-    double balance;
+    std::vector<Cell> cells;
+    size_t n = body.size() / PAYLOAD_SIZE;
+    for (size_t i = 0; i < n; ++i) {
+        Cell c;
+        c.vpi = vpi; c.vci = vci;
+        c.pt = (i == n - 1) ? 1 : 0;
+        for (int j = 0; j < PAYLOAD_SIZE; ++j) c.payload[j] = body[i * PAYLOAD_SIZE + j];
+        cells.push_back(c);
+    }
+    return cells;
+}
 
+class Reassembler {
+    std::map<std::pair<int, int>, Bytes> buf_;
 public:
-
-    Account() {
-        accountId = 0;
-        accountHolder = "";
-        balance = 0;
-    }
-
-    Account(int id, string name, double initialBalance) {
-        accountId = id;
-        accountHolder = name;
-        balance = initialBalance;
-    }
-
-    int getAccountId() const {
-        return accountId;
-    }
-
-    string getAccountHolder() const {
-        return accountHolder;
-    }
-
-    double getBalance() const {
-        return balance;
-    }
-
-    bool withdraw(double amount) {
-
-        if (amount <= 0) {
-            return false;
-        }
-
-        if (amount > balance) {
-            return false;
-        }
-
-        balance -= amount;
-
-        return true;
-    }
-
-    bool deposit(double amount) {
-
-        if (amount <= 0) {
-            return false;
-        }
-
-        balance += amount;
-
-        return true;
+    std::optional<std::string> push(const Cell& c) {
+        Bytes& b = buf_[{c.vpi, c.vci}];
+        b.insert(b.end(), c.payload.begin(), c.payload.end());
+        if (!(c.pt & 1)) return std::nullopt;
+        Bytes pdu = std::move(b);
+        buf_.erase({c.vpi, c.vci});
+        size_t n = pdu.size();
+        uint32_t crc = 0;
+        for (int i = 0; i < 4; ++i) crc = (crc << 8) | pdu[n - 4 + i];
+        if (crc32(pdu.data(), n - 4) != crc) return std::nullopt;   // corrupted
+        size_t len = (size_t(pdu[n - 6]) << 8) | pdu[n - 5];
+        return std::string(pdu.begin(), pdu.begin() + len);
     }
 };
 
-
-
-struct TransactionLog {
-    int transactionId;
-    int accountId;
-    TransactionType type;
-
-    double amount;
-
-    bool successful;
-
-    string response;
-};
-
-
-class CellSwitch {
-
+// ------------------------------------------------------------------ devices
+class Device {
 public:
+    std::string name;
+    std::map<int, std::pair<Device*, int>> ports;   // port -> (peer, peer port)
 
-    string routeCell(const Cell& cell) {
+    explicit Device(std::string n) : name(std::move(n)) {}
+    virtual ~Device() = default;
+    virtual void receive(int port, Cell cell) = 0;
 
-        if (cell.destination == 1) {
-            return "BANKING_PROCESSOR";
-        }
-
-        if (cell.destination == 2) {
-            return "AUDIT_SERVICE";
-        }
-
-        return "UNKNOWN_DESTINATION";
+    void send(int port, Cell cell) {
+        auto [peer, peerPort] = ports.at(port);
+        cell.t += CELL_TIME_US;                      // serialization/link delay
+        peer->receive(peerPort, cell);
     }
 };
 
+static void linkDevices(Device& a, int ap, Device& b, int bp) {
+    a.ports[ap] = {&b, bp};
+    b.ports[bp] = {&a, ap};
+}
 
-class TransactionProcessor {
+struct VcOut { int port, vpi, vci; };
+using VcKey = std::tuple<int, int, int>;             // (in_port, vpi, vci)
 
+class Switch : public Device {
 public:
+    std::map<VcKey, VcOut> table;
+    long switched = 0, dropped = 0;
 
-    string processCell(
-        Cell& cell,
-        unordered_map<int, Account>& accounts
-    ) {
+    using Device::Device;
 
-        
-
-        if (accounts.find(cell.accountId) == accounts.end()) {
-
-            cell.processed = true;
-            cell.successful = false;
-
-            return "Account not found";
+    void receive(int inPort, Cell in) override {
+        // Re-parse from wire bytes to exercise HEC validation
+        auto cell = Cell::fromBytes(in.toBytes(), in.t);
+        if (!cell) { ++dropped; TRACEF("%s: DROP (HEC error)", name.c_str()); return; }
+        auto it = table.find({inPort, cell->vpi, cell->vci});
+        if (it == table.end()) {
+            ++dropped;
+            TRACEF("%s: DROP (no VC for port %d)", name.c_str(), inPort);
+            return;
         }
-
-        Account& account = accounts[cell.accountId];
-
-
-        
-
-        if (cell.type == TransactionType::WITHDRAW) {
-
-            if (cell.amount <= 0) {
-
-                cell.processed = true;
-                cell.successful = false;
-
-                return "Invalid withdrawal amount";
-            }
-
-            if (account.withdraw(cell.amount)) {
-
-                cell.processed = true;
-                cell.successful = true;
-
-                return "Withdrawal successful";
-            }
-
-            cell.processed = true;
-            cell.successful = false;
-
-            return "Insufficient balance";
-        }
-
-
-        if (cell.type == TransactionType::DEPOSIT) {
-
-            if (cell.amount <= 0) {
-
-                cell.processed = true;
-                cell.successful = false;
-
-                return "Invalid deposit amount";
-            }
-
-            if (account.deposit(cell.amount)) {
-
-                cell.processed = true;
-                cell.successful = true;
-
-                return "Deposit successful";
-            }
-
-            cell.processed = true;
-            cell.successful = false;
-
-            return "Deposit failed";
-        }
-
-
-        if (cell.type == TransactionType::BALANCE) {
-
-            cell.processed = true;
-            cell.successful = true;
-
-            return "Current balance: Rs. " +
-                   to_string(account.getBalance());
-        }
-
-
-        cell.processed = true;
-        cell.successful = false;
-
-        return "Unknown transaction type";
+        const VcOut o = it->second;
+        TRACEF("%s: p%d %d/%d -> p%d %d/%d", name.c_str(), inPort, cell->vpi, cell->vci,
+               o.port, o.vpi, o.vci);
+        cell->vpi = o.vpi;                           // label swapping
+        cell->vci = o.vci;
+        cell->t += SWITCH_DELAY_US;
+        ++switched;
+        send(o.port, *cell);
     }
 };
 
+struct Account { std::string pin; double bal; };
 
-class ATMSystem {
+class BankServer : public Device {
+    Reassembler rasm_;
+public:
+    std::map<int, Account> accounts;
+
+    BankServer() : Device("BANK") {}
+    void addAccount(int acct, const std::string& pin, double bal) { accounts[acct] = {pin, bal}; }
+
+    void receive(int port, Cell cell) override {
+        auto msg = rasm_.push(cell);
+        if (!msg) return;
+        std::string reply = process(*msg);
+        TRACEF("BANK: request '%s' -> '%s'", msg->c_str(), reply.c_str());
+        double t0 = cell.t + BANK_PROC_US;
+        auto cells = segment(reply, cell.vpi, cell.vci);
+        for (size_t i = 0; i < cells.size(); ++i) {
+            cells[i].t = t0 + i * CELL_TIME_US;
+            send(port, cells[i]);                    // reply on same VC (duplex)
+        }
+    }
 
 private:
+    static std::string money(double v) { char b[64]; std::snprintf(b, sizeof b, "%.2f", v); return b; }
 
-
-    unordered_map<int, Account> accounts;
-
-   
-    queue<Cell> transactionQueue;
-
-
-    vector<TransactionLog> transactionHistory;
-
-
-    CellSwitch cellSwitch;
-
-    TransactionProcessor processor;
-
-    
-    int nextCellId;
-    int nextTransactionId;
-
-    int successfulTransactions;
-    int failedTransactions;
-
-
-public:
-
-    ATMSystem() {
-
-        nextCellId = 1;
-        nextTransactionId = 1001;
-
-        successfulTransactions = 0;
-        failedTransactions = 0;
-    }
-
-
-
-    void addAccount(
-        int accountId,
-        string name,
-        double initialBalance
-    ) {
-
-        accounts.emplace(
-            accountId,
-            Account(
-                accountId,
-                name,
-                initialBalance
-            )
-        );
-    }
-
-
-    bool accountExists(int accountId) {
-
-        return accounts.find(accountId)
-               != accounts.end();
-    }
-
-
-    void showAccount(int accountId) {
-
-        if (!accountExists(accountId)) {
-
-            cout << "Account not found.\n";
-
-            return;
+    std::string process(const std::string& msg) {
+        std::vector<std::string> f;
+        std::stringstream ss(msg);
+        for (std::string s; std::getline(ss, s, '|');) f.push_back(s);
+        if (f.size() != 4) return "ERR|BAD_REQUEST";
+        int acct; double amt;
+        try { acct = std::stoi(f[1]); amt = std::stod(f[3]); }
+        catch (...) { return "ERR|BAD_REQUEST"; }
+        auto it = accounts.find(acct);
+        if (it == accounts.end() || it->second.pin != f[2]) return "ERR|AUTH_FAILED";
+        Account& a = it->second;
+        const std::string& op = f[0];
+        if (op == "BAL") return "OK|" + money(a.bal);
+        if (amt <= 0) return "ERR|INVALID_AMOUNT";
+        if (op == "DEP") { a.bal += amt; return "OK|" + money(a.bal); }
+        if (op == "WDR") {
+            if (amt > a.bal) return "ERR|INSUFFICIENT_FUNDS|" + money(a.bal);
+            a.bal -= amt;
+            return "OK|" + money(a.bal);
         }
-
-        Account& account = accounts[accountId];
-
-        cout << "\n-----------------------------\n";
-        cout << "Account ID      : "
-             << account.getAccountId() << "\n";
-
-        cout << "Account Holder  : "
-             << account.getAccountHolder() << "\n";
-
-        cout << fixed << setprecision(2);
-
-        cout << "Balance         : Rs. "
-             << account.getBalance() << "\n";
-
-        cout << "-----------------------------\n";
-    }
-
-
-   
-
-    void establishConnection(int accountId) {
-
-        cout << "\n[CONNECTION] ";
-        cout << "Connection established for Account "
-             << accountId << "\n";
-    }
-
-
-    void terminateConnection(int accountId) {
-
-        cout << "[CONNECTION] ";
-        cout << "Connection terminated for Account "
-             << accountId << "\n";
-    }
-
-
-
-    Cell createCell(
-        int accountId,
-        TransactionType type,
-        double amount
-    ) {
-
-        Cell cell;
-
-        cell.cellId = nextCellId++;
-
-        cell.transactionId =
-            nextTransactionId++;
-
-        cell.accountId = accountId;
-
-        cell.type = type;
-
-        cell.amount = amount;
-
-   
-        cell.source = 0;
-
-        cell.destination = 1;
-
-        cell.processed = false;
-
-        cell.successful = false;
-
-        cell.response = "";
-
-        return cell;
-    }
-
-
-
-    void enqueueTransaction(Cell cell) {
-
-        transactionQueue.push(cell);
-    }
-
-
-    
-
-    void processNextCell() {
-
-        if (transactionQueue.empty()) {
-
-            cout << "No transactions in queue.\n";
-
-            return;
-        }
-
-  
-        Cell cell = transactionQueue.front();
-
-
-        transactionQueue.pop();
-
-
-        cout << "\n========================================\n";
-
-        cout << "Processing Cell\n";
-
-        cout << "Cell ID        : "
-             << cell.cellId << "\n";
-
-        cout << "Transaction ID : "
-             << cell.transactionId << "\n";
-
-        cout << "Account ID     : "
-             << cell.accountId << "\n";
-
-
-     
-
-        establishConnection(cell.accountId);
-
-
-      
-
-        string destination =
-            cellSwitch.routeCell(cell);
-
-        cout << "[SWITCH] Cell "
-             << cell.cellId
-             << " routed to "
-             << destination << "\n";
-
-
-
-        cell.response =
-            processor.processCell(
-                cell,
-                accounts
-            );
-
-
-
-        if (cell.successful) {
-
-            successfulTransactions++;
-
-        } else {
-
-            failedTransactions++;
-        }
-
-
-    
-
-        TransactionLog log;
-
-        log.transactionId =
-            cell.transactionId;
-
-        log.accountId =
-            cell.accountId;
-
-        log.type =
-            cell.type;
-
-        log.amount =
-            cell.amount;
-
-        log.successful =
-            cell.successful;
-
-        log.response =
-            cell.response;
-
-        transactionHistory.push_back(log);
-
-
-     
-
-        cout << "[PROCESSOR] "
-             << cell.response
-             << "\n";
-
-
-      
-
-        terminateConnection(cell.accountId);
-
-        cout << "========================================\n";
-    }
-
-
-    
-
-    void processAllTransactions() {
-
-        while (!transactionQueue.empty()) {
-
-            processNextCell();
-        }
-    }
-
-
-  
-
-    void withdraw(
-        int accountId,
-        double amount
-    ) {
-
-        if (!accountExists(accountId)) {
-
-            cout << "Account not found.\n";
-
-            return;
-        }
-
-        Cell cell =
-            createCell(
-                accountId,
-                TransactionType::WITHDRAW,
-                amount
-            );
-
-        enqueueTransaction(cell);
-
-        cout << "\nWithdrawal transaction added to queue.\n";
-
-        processNextCell();
-    }
-
-
-    void deposit(
-        int accountId,
-        double amount
-    ) {
-
-        if (!accountExists(accountId)) {
-
-            cout << "Account not found.\n";
-
-            return;
-        }
-
-        Cell cell =
-            createCell(
-                accountId,
-                TransactionType::DEPOSIT,
-                amount
-            );
-
-        enqueueTransaction(cell);
-
-        cout << "\nDeposit transaction added to queue.\n";
-
-        processNextCell();
-    }
-
-
-    void balanceInquiry(
-        int accountId
-    ) {
-
-        if (!accountExists(accountId)) {
-
-            cout << "Account not found.\n";
-
-            return;
-        }
-
-        Cell cell =
-            createCell(
-                accountId,
-                TransactionType::BALANCE,
-                0
-            );
-
-        enqueueTransaction(cell);
-
-        cout << "\nBalance inquiry added to queue.\n";
-
-        processNextCell();
-    }
-
-
-
-    void simulateTransactions(int numberOfTransactions) {
-
-        cout << "\n";
-        cout << "========================================\n";
-        cout << "STARTING TRANSACTION SIMULATION\n";
-        cout << "Transactions: "
-             << numberOfTransactions << "\n";
-        cout << "========================================\n";
-
-
-     
-        random_device rd;
-
-        mt19937 generator(rd());
-
-
-     
-
-        uniform_int_distribution<int>
-            typeDistribution(0, 2);
-
-
-    
-
-        uniform_int_distribution<int>
-            amountDistribution(100, 5000);
-
-
-        
-
-        int accountId = 1001;
-
-
-        for (int i = 0;
-             i < numberOfTransactions;
-             i++) {
-
-
-            int randomType =
-                typeDistribution(generator);
-
-
-            TransactionType type;
-
-
-            if (randomType == 0) {
-
-                type = TransactionType::WITHDRAW;
-
-            }
-            else if (randomType == 1) {
-
-                type = TransactionType::DEPOSIT;
-
-            }
-            else {
-
-                type = TransactionType::BALANCE;
-            }
-
-
-            double amount = 0;
-
-
-            if (type != TransactionType::BALANCE) {
-
-                amount =
-                    amountDistribution(generator);
-            }
-
-
-            Cell cell =
-                createCell(
-                    accountId,
-                    type,
-                    amount
-                );
-
-
-            enqueueTransaction(cell);
-        }
-
-
-
-        processAllTransactions();
-
-
-        cout << "\n";
-        cout << "========================================\n";
-        cout << "SIMULATION COMPLETE\n";
-        cout << "========================================\n";
-    }
-
-
-
-    void showStatistics() {
-
-        cout << "\n";
-        cout << "========================================\n";
-        cout << "TRANSACTION STATISTICS\n";
-        cout << "========================================\n";
-
-        cout << "Total Transactions : "
-             << transactionHistory.size()
-             << "\n";
-
-        cout << "Successful         : "
-             << successfulTransactions
-             << "\n";
-
-        cout << "Failed             : "
-             << failedTransactions
-             << "\n";
-
-
-        if (!transactionHistory.empty()) {
-
-            double successRate =
-                (successfulTransactions * 100.0)
-                / transactionHistory.size();
-
-            cout << fixed
-                 << setprecision(2);
-
-            cout << "Success Rate       : "
-                 << successRate
-                 << "%\n";
-        }
-
-        cout << "========================================\n";
-    }
-
-
-
-    void showTransactionHistory() {
-
-        cout << "\n";
-        cout << "========================================\n";
-        cout << "TRANSACTION HISTORY\n";
-        cout << "========================================\n";
-
-
-        for (const auto& log :
-             transactionHistory) {
-
-
-            cout << "\nTransaction ID : "
-                 << log.transactionId;
-
-            cout << "\nAccount ID     : "
-                 << log.accountId;
-
-
-            cout << "\nType           : ";
-
-
-            if (log.type ==
-                TransactionType::WITHDRAW) {
-
-                cout << "WITHDRAW";
-            }
-
-            else if (
-                log.type ==
-                TransactionType::DEPOSIT) {
-
-                cout << "DEPOSIT";
-            }
-
-            else {
-
-                cout << "BALANCE";
-            }
-
-
-            cout << "\nAmount         : Rs. "
-                 << fixed
-                 << setprecision(2)
-                 << log.amount;
-
-
-            cout << "\nStatus         : ";
-
-
-            if (log.successful) {
-
-                cout << "SUCCESS";
-
-            } else {
-
-                cout << "FAILED";
-            }
-
-
-            cout << "\nResponse       : "
-                 << log.response;
-
-            cout << "\n-----------------------------";
-        }
-
-        cout << "\n";
+        return "ERR|UNKNOWN_OP";
     }
 };
 
+struct SwitchHop { Switch* sw; int inPort, outPort; };
+struct TxResult  { std::string reply; double rtt; int cells; };
 
+class Terminal : public Device {
+    Reassembler rasm_;
+    int vci_ = FIRST_VCI;
+    std::vector<std::pair<Switch*, VcKey>> installed_;   // entries to tear down
+    std::string reply_;
+    double replyT_ = 0.0;
+public:
+    bool open = false;
+    int vpi = 0, vci = 0;                                // label on link l0
+    int calls = 0;
 
+    Terminal() : Device("ATM-01") {}
 
-int main() {
+    void receive(int, Cell cell) override {
+        if (auto m = rasm_.push(cell)) { reply_ = *m; replyT_ = cell.t; }
+    }
 
-    ATMSystem atm;
+    // SETUP / CONNECT: install forward + reverse label entries in every switch
+    double connect(const std::vector<SwitchHop>& path) {
+        if (open) throw std::runtime_error("VC already open");
+        std::vector<int> labels;
+        for (size_t i = 0; i <= path.size(); ++i) labels.push_back(++vci_);
+        for (size_t i = 0; i < path.size(); ++i) {
+            Switch* sw = path[i].sw;
+            VcKey fwd{path[i].inPort, 0, labels[i]}, rev{path[i].outPort, 0, labels[i + 1]};
+            sw->table[fwd] = {path[i].outPort, 0, labels[i + 1]};
+            sw->table[rev] = {path[i].inPort, 0, labels[i]};
+            installed_.push_back({sw, fwd});
+            installed_.push_back({sw, rev});
+        }
+        vpi = 0; vci = labels[0]; open = true; ++calls;
+        double us = 2 * (path.size() * CALL_PROC_US + (path.size() + 1) * CELL_TIME_US);
+        TRACEF("SETUP/CONNECT done: VC %d/%d, %.1f us", vpi, vci, us);
+        return us;
+    }
 
+    // RELEASE: remove this call's entries from every switch
+    void release() {
+        for (auto& [sw, key] : installed_) sw->table.erase(key);
+        installed_.clear();
+        open = false;
+    }
 
+    TxResult transact(const std::string& op, int acct, const std::string& pin, double amount = 0.0) {
+        if (!open) throw std::runtime_error("no connection - call connect() first");
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "%s|%d|%s|%.2f", op.c_str(), acct, pin.c_str(), amount);
+        auto cells = segment(buf, vpi, vci);
+        reply_.clear();
+        for (size_t i = 0; i < cells.size(); ++i) {
+            cells[i].t = i * CELL_TIME_US;
+            send(0, cells[i]);
+        }
+        return {reply_, replyT_, int(cells.size())};
+    }
 
+    // Demonstrates that cells on an unestablished/released VC are discarded
+    void sendRawCell(int vpi_, int vci_arg) {
+        Cell c; c.vpi = vpi_; c.vci = vci_arg; c.pt = 1;
+        send(0, c);
+    }
+};
 
-    atm.addAccount(
-        1001,
-        "John Doe",
-        50000
-    );
+// ---------------------------------------------------------------- the network
+struct Network {
+    Terminal term;
+    Switch sw1{"SW1"}, sw2{"SW2"};
+    BankServer bank;
+    std::vector<SwitchHop> path;
 
+    Network() {
+        linkDevices(term, 0, sw1, 0);
+        linkDevices(sw1, 1, sw2, 0);
+        linkDevices(sw2, 1, bank, 0);
+        bank.addAccount(1001, "1111", 5000);
+        bank.addAccount(1002, "2222", 3200);
+        bank.addAccount(1003, "3333", 750);
+        bank.addAccount(1004, "4444", 12000);
+        bank.addAccount(1005, "5555", 60);
+        path = {{&sw1, 0, 1}, {&sw2, 0, 1}};
+    }
+};
 
-    atm.addAccount(
-        1002,
-        "Alice",
-        25000
-    );
+// ------------------------------------------------------------------ auto mode
+static void runAuto(int n, unsigned seed, bool showTrace) {
+    std::mt19937 rng(seed);
+    Network net;
+    auto& term = net.term;
 
+    std::vector<std::pair<int, std::string>> accts;
+    double opening = 0;
+    for (auto& [a, v] : net.bank.accounts) { accts.push_back({a, v.pin}); opening += v.bal; }
 
-    cout << "========================================\n";
-    cout << "      ATM BANKING SIMULATION\n";
-    cout << "========================================\n";
+    std::uniform_int_distribution<int> pickAcct(0, int(accts.size()) - 1), pickLen(1, 4);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    std::discrete_distribution<int> pickOp({3, 3, 4});
+    const char* ops[] = {"BAL", "DEP", "WDR"};
+    const double amounts[] = {20, 40, 60, 100, 200, 500, 1500};
+    std::uniform_int_distribution<int> pickAmt(0, 6);
 
+    int done = 0, cntOp[3] = {0, 0, 0}, ok = 0, declined = 0;
+    long totalCells = 0;
+    double netFlow = 0, setupTotal = 0, latSum = 0, latMin = 1e18, latMax = 0;
 
-   
+    std::printf("%4s %-4s %-5s %9s  %-28s %5s %8s\n", "#", "OP", "ACCT", "AMOUNT", "RESULT", "CELLS", "RTT(us)");
+    std::printf("----------------------------------------------------------------------\n");
 
-    atm.showAccount(1001);
+    while (done < n) {
+        auto [acct, goodPin] = accts[pickAcct(rng)];
+        std::string pin = unit(rng) > 0.03 ? goodPin : "0000";     // ~3% bad PINs
+        TRACE = showTrace && done < 2;
+        setupTotal += term.connect(net.path);                      // connection-oriented
+        int sessionLen = pickLen(rng);
+        for (int k = 0; k < sessionLen && done < n; ++k) {
+            int o = pickOp(rng);
+            double amt = (o == 0) ? 0.0 : amounts[pickAmt(rng)];
+            TxResult r = term.transact(ops[o], acct, pin, amt);
+            ++done; ++cntOp[o];
+            bool approved = r.reply.rfind("OK", 0) == 0;
+            approved ? ++ok : ++declined;
+            if (approved && o == 1) netFlow += amt;
+            if (approved && o == 2) netFlow -= amt;
+            totalCells += r.cells; latSum += r.rtt;
+            latMin = std::min(latMin, r.rtt); latMax = std::max(latMax, r.rtt);
+            std::printf("%4d %-4s %-5d %9.2f  %-28s %5d %8.1f\n", done, ops[o], acct, amt,
+                        r.reply.c_str(), r.cells, r.rtt);
+        }
+        term.release();
+        TRACE = false;
+    }
 
+    // Connection-oriented check: a stray cell on a released VC must be dropped
+    long before = net.sw1.dropped;
+    term.sendRawCell(0, FIRST_VCI + 1);
+    bool droppedOk = net.sw1.dropped == before + 1;
 
-  
+    double closing = 0;
+    for (auto& [a, v] : net.bank.accounts) closing += v.bal;
 
-    cout << "\n\n--- MANUAL TRANSACTIONS ---\n";
+    std::printf("\n======================================================================\n");
+    std::printf("SIMULATION SUMMARY\n");
+    std::printf("======================================================================\n");
+    std::printf("Transactions            : %d (BAL %d, DEP %d, WDR %d)\n", done, cntOp[0], cntOp[1], cntOp[2]);
+    std::printf("Approved / Declined     : %d / %d\n", ok, declined);
+    std::printf("Virtual circuits opened : %d (avg setup %.1f us)\n", term.calls, setupTotal / term.calls);
+    std::printf("Cells switched SW1/SW2  : %ld / %ld   dropped: %ld\n", net.sw1.switched,
+                net.sw2.switched, net.sw1.dropped + net.sw2.dropped);
+    std::printf("Avg cells / transaction : %.2f\n", double(totalCells) / done);
+    std::printf("Round-trip latency (us) : avg %.1f  min %.1f  max %.1f\n", latSum / done, latMin, latMax);
+    std::printf("Stray cell on released VC dropped by switch : %s\n", droppedOk ? "true" : "false");
+    std::printf("Ledger check            : opening %.2f + net %+.2f = %.2f  vs closing %.2f  [%s]\n",
+                opening, netFlow, opening + netFlow, closing,
+                std::abs(opening + netFlow - closing) < 0.01 ? "PASS" : "FAIL");
+}
 
+// ----------------------------------------------------------- interactive mode
+static void runInteractive() {
+    Network net;
+    auto& term = net.term;
+    std::printf("=== ATM (Asynchronous Transfer Mode) Banking Simulator ===\n");
+    std::printf("Demo accounts: 1001/1111  1002/2222  1003/3333  1004/4444  1005/5555\n");
+    std::printf("During a session, enter 't' to toggle cell tracing.\n\n");
 
+    std::string line;
+    while (true) {
+        std::printf("Account number (blank to quit): ");
+        if (!std::getline(std::cin, line) || line.empty()) break;
+        std::string acctS = line;
+        std::printf("PIN: ");
+        std::getline(std::cin, line);
+        std::string pin = line;
+        if (acctS.find_first_not_of("0123456789") != std::string::npos) {
+            std::printf("Invalid account.\n\n");
+            continue;
+        }
+        int acct = std::stoi(acctS);
+        double us = term.connect(net.path);
+        std::printf("[signaling] VC %d/%d established in %.1f us\n\n", term.vpi, term.vci, us);
 
-    atm.withdraw(
-        1001,
-        5000
-    );
+        while (true) {
+            std::printf("1) Balance  2) Deposit  3) Withdraw  4) End session  (t=trace): ");
+            if (!std::getline(std::cin, line) || line == "4") break;
+            if (line == "t") { TRACE = !TRACE; std::printf("trace %s\n", TRACE ? "on" : "off"); continue; }
+            if (line != "1" && line != "2" && line != "3") continue;
+            const std::string choice = line;
+            const char* op = (choice == "1") ? "BAL" : (choice == "2") ? "DEP" : "WDR";
+            double amt = 0;
+            if (choice != "1") {
+                std::printf("Amount: ");
+                std::getline(std::cin, line);
+                try { amt = std::stod(line); } catch (...) { std::printf("Invalid amount.\n"); continue; }
+            }
+            TxResult r = term.transact(op, acct, pin, amt);
+            std::printf("  -> %s   (%d cells, RTT %.1f us)\n\n", r.reply.c_str(), r.cells, r.rtt);
+        }
+        term.release();
+        TRACE = false;
+        std::printf("[signaling] VC released.\n\n");
+    }
+}
 
-
-
-
-    atm.deposit(
-        1001,
-        10000
-    );
-
-
-
-
-    atm.balanceInquiry(
-        1001
-    );
-
-
-
-    atm.withdraw(
-        1001,
-        100000
-    );
-
-
-
-    cout << "\n\n--- UPDATED ACCOUNT ---\n";
-
-    atm.showAccount(1001);
-
-
-
-    atm.simulateTransactions(100);
-
-
-    
-
-    atm.showStatistics();
-
-
-
-    cout << "\n\n--- FINAL ACCOUNT STATUS ---\n";
-
-    atm.showAccount(1001);
-
-
+int main(int argc, char** argv) {
+    int autoN = 0; unsigned seed = 42; bool trace = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--auto" && i + 1 < argc) autoN = std::atoi(argv[++i]);
+        else if (a == "--seed" && i + 1 < argc) seed = unsigned(std::atoi(argv[++i]));
+        else if (a == "--trace") trace = true;
+        else { std::fprintf(stderr, "usage: %s [--auto N] [--seed S] [--trace]\n", argv[0]); return 1; }
+    }
+    if (autoN > 0) runAuto(autoN, seed, trace);
+    else runInteractive();
     return 0;
 }
